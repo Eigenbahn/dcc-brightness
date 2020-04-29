@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+
+import os, sys
+import subprocess as s
+import argparse
+import shlex
+import re
+import json
+from pprint import pprint
+
+
+# ---------------------------------------------------------------
+# ARGS
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--bus", help="I2C bus id", type=int)
+parser.add_argument("--delta", help="window class", type=int)
+parser.add_argument("--set", help="window class", type=int)
+args = parser.parse_args()
+
+
+# ---------------------------------------------------------------
+# CONSTANTS
+
+BRIGHTNESS='0x10'
+
+
+## ------------------------------------------------------------------------
+## UTILS: CACHE
+
+def read_cache():
+    with open("/tmp/dcc.cache") as f:
+        return json.load(f)
+
+def write_cache(o):
+    with open("/tmp/dcc.cache", "w") as f:
+        json.dump(o, f)
+
+def read_or_make_cache(write=False):
+    cache = None
+    try:
+        cache = read_cache()
+    except FileNotFoundError:
+        displays = get_diplays()
+        for d_id, d in displays.items():
+            values = get_values(d['bus'], BRIGHTNESS)
+            displays[d_id] = {**d, **values}
+        if write:
+            write_cache(displays)
+        cache = displays
+    return cache
+
+
+## ------------------------------------------------------------------------
+## UTILS: DDC
+
+def get_diplays():
+    command = 'ddcutil detect'
+    ret = s.run(shlex.split(command), stdout=s.PIPE)
+    if ret.returncode != 0:
+        return
+    out = ret.stdout.decode('utf-8')
+    lines = out.split('\n')
+    displays = {}
+    display_id = None
+    for l in lines:
+        if l.startswith('Display '):
+            display_id = int(l[len('Display '):])
+            displays[display_id] = {}
+            continue
+        match = re.search(r'I2C bus:\s*/dev/i2c-(\S*)$', l)
+        if match:
+            displays[display_id]['bus'] = match.group(1)
+            continue
+        match = re.search(r'Model:\s*(.*)$', l)
+        if match:
+            displays[display_id]['model'] = match.group(1)
+            continue
+    return displays
+
+def get_values(bus, feature):
+    command = 'ddcutil --bus=' + bus + ' getvcp ' + feature
+    ret = s.run(shlex.split(command), stdout=s.PIPE)
+    if ret.returncode != 0:
+        return
+    out = ret.stdout.decode('utf-8')
+
+    values = {}
+    match = re.search(r'current value =\s*(\d*),?', out)
+    if match:
+        values['current'] = int(match.group(1))
+    match = re.search(r'max value =\s*(\d*),?', out)
+    if match:
+        values['max'] = int(match.group(1))
+    return values
+
+def get_value(bus, feature):
+    return get_values(bus, feature)['current']
+
+def get_max_value(bus, feature):
+    return get_values(bus, feature)['max']
+
+def set_value(bus, feature, value):
+    command = 'ddcutil --bus=' + bus + ' setvcp ' + feature + ' ' + str(value)
+    s.run(shlex.split(command))
+
+
+## ------------------------------------------------------------------------
+## UTILS: BRIGHTNESS
+
+def apply_brightness_delta(bus, delta, current_v=None, max_v=None):
+    if not current_v or not max_v:
+        values = get_values(bus, feature)['current']
+        current_v = values['current']
+        max_v = values['max']
+    expected_v = current_v + delta
+    if expected_v >= 0 and expected_v <= max_v:
+        set_value(bus, BRIGHTNESS, expected_v)
+        current_v = expected_v
+    return {
+        'current': current_v,
+        'max': max_v,
+    }
+
+def set_brightness(bus, v, current_v=None, max_v=None):
+    if not current_v or not max_v:
+        values = get_values(bus, feature)['current']
+        current_v = values['current']
+        max_v = values['max']
+    if v >= 0 and v <= max_v:
+        set_value(bus, BRIGHTNESS, v)
+        current_v = v
+    return {
+        'current': current_v,
+        'max': max_v,
+    }
+
+
+## ------------------------------------------------------------------------
+## MAIN
+
+displays = read_or_make_cache(True)
+
+for d_id, d in displays.items():
+    bus = d['bus']
+    curr_brightness = d['current']
+    max_brightness = d['max']
+
+    new_values = None
+    if args.delta:
+        new_values = apply_brightness_delta(bus, args.delta, curr_brightness, max_brightness)
+    elif args.set:
+        new_values = apply_brightness_delta(bus, args.set, curr_brightness, max_brightness)
+
+    if new_values:
+        displays[d_id] = {**d, **new_values}
+
+write_cache(displays)
